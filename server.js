@@ -1,3 +1,4 @@
+
 const express = require("express");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
@@ -5,17 +6,10 @@ const { Readable } = require("node:stream");
 
 const app = express();
 
-app.use(helmet());
-app.use(express.json({ limit: "10kb" }));
-
-app.use(rateLimit({
-  windowMs: 60 * 1000,
-  limit: 15,
-  standardHeaders: "draft-8",
-  legacyHeaders: false
-}));
-
 const PORT = process.env.PORT || 3000;
+
+const SITE_ORIGIN =
+  "https://admirable-madeleine-be5345.netlify.app";
 
 const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "")
   .split(",")
@@ -30,6 +24,47 @@ const MEDIA_TYPES = [
   "application/octet-stream"
 ];
 
+// Segurança básica
+app.use(helmet());
+app.use(express.json({ limit: "10kb" }));
+
+// Conexão com o site da Netlify
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin === SITE_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", SITE_ORIGIN);
+    res.setHeader("Vary", "Origin");
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET, POST, OPTIONS"
+    );
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type"
+    );
+  } else if (origin) {
+    return res.status(403).json({
+      error: "Origem não autorizada."
+    });
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
+// Limite de requisições
+app.use(rateLimit({
+  windowMs: 60 * 1000,
+  limit: 15,
+  standardHeaders: "draft-8",
+  legacyHeaders: false
+}));
+
+// Validar endereço de download
 function validarUrl(value) {
   let url;
 
@@ -50,12 +85,15 @@ function validarUrl(value) {
   const host = url.hostname.toLowerCase();
 
   if (!ALLOWED_HOSTS.includes(host)) {
-    throw new Error("Este domínio ainda não está autorizado.");
+    throw new Error(
+      "Este domínio ainda não está autorizado."
+    );
   }
 
   return url;
 }
 
+// Limpar nome do arquivo
 function nomeSeguro(value) {
   return String(value || "arquivo")
     .replace(/[\r\n"]/g, "")
@@ -63,37 +101,33 @@ function nomeSeguro(value) {
     .slice(0, 120) || "arquivo";
 }
 
+// Página inicial
 app.get("/", (req, res) => {
   res.json({
     name: "Multi Download",
     status: "online",
-    version: "1.0.0",
+    version: "1.1.0",
     message: "Servidor de downloads iniciado."
   });
 });
 
+// Verificar API
 app.get("/api/status", (req, res) => {
   res.json({
     online: true,
     downloads: true,
-    version: "1.0.0"
+    version: "1.1.0"
   });
 });
 
+// API de download de arquivos diretos autorizados
 app.get("/api/download", async (req, res) => {
   let remote;
-
-  try {
-    remote = validarUrl(req.query.url);
-  } catch (error) {
-    return res.status(400).json({
-      error: error.message
-    });
-  }
-
   let response;
 
   try {
+    remote = validarUrl(req.query.url);
+
     for (let attempt = 0; attempt < 4; attempt++) {
       response = await fetch(remote, {
         redirect: "manual",
@@ -118,15 +152,21 @@ app.get("/api/download", async (req, res) => {
     }
 
     if (!response || !response.ok) {
-      throw new Error("Não foi possível acessar o arquivo.");
+      throw new Error(
+        "Não foi possível acessar o arquivo."
+      );
     }
 
     const contentType = (
       response.headers.get("content-type") || ""
     ).split(";")[0].trim().toLowerCase();
 
-    if (!MEDIA_TYPES.some(type => contentType.startsWith(type))) {
-      throw new Error("O endereço não forneceu um arquivo de mídia.");
+    if (!MEDIA_TYPES.some(type =>
+      contentType.startsWith(type)
+    )) {
+      throw new Error(
+        "O endereço não forneceu um arquivo de mídia."
+      );
     }
 
     const contentLength = Number(
@@ -134,7 +174,9 @@ app.get("/api/download", async (req, res) => {
     );
 
     if (contentLength > MAX_SIZE) {
-      throw new Error("O arquivo ultrapassa 500 MB.");
+      throw new Error(
+        "O arquivo ultrapassa o limite de 500 MB."
+      );
     }
 
     if (!response.body) {
@@ -185,9 +227,9 @@ app.get("/api/download", async (req, res) => {
   }
 });
 
+// Iniciar servidor
 app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `Multi Download online na porta ${PORT}`
   );
 });
-  
