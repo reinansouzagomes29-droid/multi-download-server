@@ -1,4 +1,6 @@
 
+"use strict";
+
 const express = require("express");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
@@ -6,17 +8,22 @@ const dns = require("node:dns").promises;
 const net = require("node:net");
 
 const app = express();
-const PORT = process.env.PORT || 10000;
 
+const PORT = process.env.PORT || 10000;
 const SITE_ORIGIN = "https://multi-download-br.netlify.app";
 const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
 app.disable("x-powered-by");
+
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-app.use(express.json({ limit: "30kb" }));
+app.use(express.json({ limit: "20kb" }));
+
+// --------------------------------------------------
+// CORS
+// --------------------------------------------------
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -40,68 +47,116 @@ app.use((req, res, next) => {
   next();
 });
 
-const downloadLimiter = rateLimit({
+// --------------------------------------------------
+// LIMITADOR DE REQUISIÇÕES
+// --------------------------------------------------
+
+const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 10,
+  limit: 30,
   standardHeaders: "draft-7",
-  legacyHeaders: false,
-  message: {
-    ok: false,
-    error: "Muitas tentativas. Aguarde um minuto."
-  }
+  legacyHeaders: false
 });
 
-const platformPatterns = [
+const downloadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 8,
+  standardHeaders: "draft-7",
+  legacyHeaders: false
+});
+
+app.use("/api", apiLimiter);
+
+// --------------------------------------------------
+// PLATAFORMAS RECONHECIDAS
+// --------------------------------------------------
+
+const PLATFORMS = [
   {
     name: "YouTube",
-    patterns: [
-      /(^|\.)youtube\.com$/i,
-      /(^|\.)youtu\.be$/i,
-      /(^|\.)youtube-nocookie\.com$/i
-    ]
+    hosts: ["youtube.com", "www.youtube.com", "m.youtube.com",
+      "youtu.be", "music.youtube.com", "youtube-nocookie.com"]
   },
   {
     name: "TikTok",
-    patterns: [
-      /(^|\.)tiktok\.com$/i,
-      /(^|\.)tiktokv\.com$/i
-    ]
+    hosts: ["tiktok.com", "www.tiktok.com", "m.tiktok.com",
+      "vm.tiktok.com", "vt.tiktok.com"]
   },
   {
     name: "Instagram",
-    patterns: [
-      /(^|\.)instagram\.com$/i
-    ]
+    hosts: ["instagram.com", "www.instagram.com",
+      "m.instagram.com"]
   },
   {
     name: "Facebook",
-    patterns: [
-      /(^|\.)facebook\.com$/i,
-      /(^|\.)fb\.watch$/i,
-      /(^|\.)fb\.com$/i
-    ]
+    hosts: ["facebook.com", "www.facebook.com", "m.facebook.com",
+      "fb.watch", "fb.com"]
   },
   {
     name: "Kwai",
-    patterns: [
-      /(^|\.)kwai\.com$/i,
-      /(^|\.)kuaishou\.com$/i
-    ]
+    hosts: ["kwai.com", "www.kwai.com", "m.kwai.com",
+      "kuaishou.com", "www.kuaishou.com"]
   },
   {
     name: "X",
-    patterns: [
-      /(^|\.)x\.com$/i,
-      /(^|\.)twitter\.com$/i
-    ]
+    hosts: ["x.com", "www.x.com", "twitter.com",
+      "www.twitter.com", "mobile.twitter.com"]
   }
 ];
 
-function identifyPlatform(url) {
-  const hostname = url.hostname.toLowerCase();
+const MEDIA_EXTENSIONS = [
+  ".mp4", ".m4v", ".webm", ".mov", ".mkv",
+  ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"
+];
 
-  for (const platform of platformPatterns) {
-    if (platform.patterns.some(pattern => pattern.test(hostname))) {
+const MIME_TYPES = [
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-matroska",
+  "audio/mpeg",
+  "audio/mp4",
+  "audio/aac",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/ogg",
+  "audio/flac",
+  "application/octet-stream"
+];
+
+// --------------------------------------------------
+// UTILITÁRIOS
+// --------------------------------------------------
+
+function parseUrl(value) {
+  if (typeof value !== "string" || value.length > 4096) {
+    throw new Error("Informe um link válido.");
+  }
+
+  let url;
+
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error("O link informado não é válido.");
+  }
+
+  if (url.protocol !== "https:") {
+    throw new Error("Por segurança, utilize um link HTTPS.");
+  }
+
+  if (url.username || url.password) {
+    throw new Error("Links com credenciais não são aceitos.");
+  }
+
+  return url;
+}
+
+function identifyPlatform(url) {
+  const host = url.hostname.toLowerCase();
+
+  for (const platform of PLATFORMS) {
+    if (platform.hosts.includes(host)) {
       return platform.name;
     }
   }
@@ -109,41 +164,36 @@ function identifyPlatform(url) {
   return null;
 }
 
-function parseHttpUrl(value) {
-  if (typeof value !== "string" || value.length > 4096) {
-    throw new Error("Informe um endereço válido.");
-  }
+function looksLikeMediaFile(url) {
+  const pathname = url.pathname.toLowerCase();
+  return MEDIA_EXTENSIONS.some(extension =>
+    pathname.endsWith(extension)
+  );
+}
 
-  let parsed;
+function getAllowedHosts() {
+  return (process.env.ALLOWED_HOSTS || "")
+    .split(",")
+    .map(host => host.trim().toLowerCase())
+    .filter(Boolean);
+}
 
-  try {
-    parsed = new URL(value.trim());
-  } catch {
-    throw new Error("O endereço informado é inválido.");
-  }
+function isHostAllowed(hostname) {
+  const allowed = getAllowedHosts();
 
-  if (parsed.protocol !== "https:") {
-    throw new Error("Por segurança, somente links HTTPS são aceitos.");
-  }
-
-  if (parsed.username || parsed.password) {
-    throw new Error("Links com usuário ou senha não são aceitos.");
-  }
-
-  return parsed;
+  return allowed.some(host =>
+    hostname === host || hostname.endsWith("." + host)
+  );
 }
 
 function isPublicIp(address) {
   const family = net.isIP(address);
 
   if (family === 4) {
-    const parts = address.split(".").map(Number);
-    const [a, b] = parts;
+    const [a, b] = address.split(".").map(Number);
 
     if (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
+      a === 0 || a === 10 || a === 127 ||
       (a === 169 && b === 254) ||
       (a === 172 && b >= 16 && b <= 31) ||
       (a === 192 && b === 168) ||
@@ -162,14 +212,10 @@ function isPublicIp(address) {
     const ip = address.toLowerCase();
 
     if (
-      ip === "::" ||
-      ip === "::1" ||
-      ip.startsWith("fc") ||
-      ip.startsWith("fd") ||
-      ip.startsWith("fe8") ||
-      ip.startsWith("fe9") ||
-      ip.startsWith("fea") ||
-      ip.startsWith("feb") ||
+      ip === "::" || ip === "::1" ||
+      ip.startsWith("fc") || ip.startsWith("fd") ||
+      ip.startsWith("fe8") || ip.startsWith("fe9") ||
+      ip.startsWith("fea") || ip.startsWith("feb") ||
       ip.startsWith("::ffff:")
     ) {
       return false;
@@ -181,25 +227,10 @@ function isPublicIp(address) {
   return false;
 }
 
-function getAllowedHosts() {
-  return (process.env.ALLOWED_HOSTS || "")
-    .split(",")
-    .map(host => host.trim().toLowerCase())
-    .filter(Boolean);
-}
-
-function hostIsAllowed(hostname) {
-  const allowed = getAllowedHosts();
-
-  return allowed.some(host =>
-    hostname === host || hostname.endsWith("." + host)
-  );
-}
-
-async function validateMediaUrl(url) {
-  if (!hostIsAllowed(url.hostname.toLowerCase())) {
+async function validateDirectHost(url) {
+  if (!isHostAllowed(url.hostname.toLowerCase())) {
     throw new Error(
-      "Este domínio não está autorizado para downloads neste servidor."
+      "Este domínio ainda não foi autorizado para downloads."
     );
   }
 
@@ -208,38 +239,78 @@ async function validateMediaUrl(url) {
     verbatim: true
   });
 
-  if (!addresses.length || addresses.some(item => !isPublicIp(item.address))) {
-    throw new Error("O endereço do servidor não passou na validação de segurança.");
+  if (
+    !addresses.length ||
+    addresses.some(item => !isPublicIp(item.address))
+  ) {
+    throw new Error("O endereço de destino não passou na validação.");
   }
 }
 
-function getFilename(url, contentType) {
-  const pathname = decodeURIComponent(url.pathname);
-  const lastPart = pathname.split("/").filter(Boolean).pop();
+function safeFilename(url, contentType) {
+  const lastPart = decodeURIComponent(url.pathname)
+    .split("/")
+    .filter(Boolean)
+    .pop();
 
-  if (lastPart && lastPart.includes(".")) {
+  if (lastPart && /\.[a-z0-9]{2,5}$/i.test(lastPart)) {
     return lastPart.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
   }
 
-  const extensions = {
+  const fallback = {
     "video/mp4": "video.mp4",
     "video/webm": "video.webm",
     "audio/mpeg": "audio.mp3",
-    "audio/mp3": "audio.mp3",
     "audio/mp4": "audio.m4a",
     "audio/wav": "audio.wav",
     "audio/ogg": "audio.ogg"
   };
 
-  return extensions[contentType] || "arquivo-download";
+  return fallback[contentType] || "arquivo-midia";
 }
+
+// --------------------------------------------------
+// ADAPTADORES DE PLATAFORMA
+// --------------------------------------------------
+
+// Cada plataforma terá seu próprio adaptador.
+// Os adaptadores serão habilitados quando houver uma
+// integração autorizada, credenciais e documentação.
+// Não simulamos downloads quando o adaptador não existe.
+
+const platformAdapters = {
+  "YouTube": null,
+  "TikTok": null,
+  "Instagram": null,
+  "Facebook": null,
+  "Kwai": null,
+  "X": null
+};
+
+function getPlatformStatus(platform) {
+  const adapter = platformAdapters[platform];
+
+  return {
+    recognized: true,
+    platform,
+    integrationConfigured: Boolean(adapter),
+    downloadAvailable: false,
+    message: adapter
+      ? "Integração configurada. A disponibilidade será verificada pela fonte."
+      : "Plataforma reconhecida. A integração de download ainda não está configurada."
+  };
+}
+
+// --------------------------------------------------
+// ROTAS PRINCIPAIS
+// --------------------------------------------------
 
 app.get("/", (req, res) => {
   res.json({
     name: "Multi Download",
     status: "online",
-    version: "2.0.0",
-    message: "Servidor iniciado."
+    version: "3.0.0",
+    message: "Servidor Multi Download iniciado."
   });
 });
 
@@ -247,40 +318,49 @@ app.get("/api/status", (req, res) => {
   res.json({
     ok: true,
     online: true,
-    downloads: true,
-    version: "2.0.0",
+    version: "3.0.0",
     platformRecognition: true,
-    imageTools: "browser",
-    directMediaDownloads: getAllowedHosts().length > 0
+    directDownloads: getAllowedHosts().length > 0,
+    imageConversion: "browser",
+    platforms: PLATFORMS.map(platform => ({
+      name: platform.name,
+      recognized: true,
+      integrationConfigured: Boolean(platformAdapters[platform.name])
+    }))
   });
 });
 
+// --------------------------------------------------
+// IDENTIFICAR LINK
+// --------------------------------------------------
+
 app.post("/api/inspect", (req, res) => {
   try {
-    const url = parseHttpUrl(req.body.url);
+    const url = parseUrl(req.body.url);
     const platform = identifyPlatform(url);
 
     if (platform) {
       return res.json({
         ok: true,
-        recognized: true,
-        platform,
-        type: "platform-page",
-        downloadAvailable: false,
-        message:
-          "Plataforma reconhecida. O download depende de uma integração autorizada e da disponibilidade do conteúdo."
+        type: "platform",
+        ...getPlatformStatus(platform)
       });
     }
 
+    const directCandidate = looksLikeMediaFile(url);
+
     return res.json({
       ok: true,
+      type: directCandidate ? "direct-candidate" : "unknown",
       recognized: true,
       platform: "Link externo",
-      type: "direct-or-unknown",
+      directCandidate,
       downloadAvailable: false,
-      message:
-        "Link reconhecido. Para confirmar se é um arquivo de mídia, use a opção de verificar arquivo."
+      message: directCandidate
+        ? "O endereço parece apontar para um arquivo de mídia. O servidor ainda precisa verificar o arquivo."
+        : "O endereço foi reconhecido, mas não parece ser um link direto de vídeo ou áudio."
     });
+
   } catch (error) {
     return res.status(400).json({
       ok: false,
@@ -290,86 +370,78 @@ app.post("/api/inspect", (req, res) => {
   }
 });
 
+// --------------------------------------------------
+// DOWNLOAD DIRETO AUTORIZADO
+// --------------------------------------------------
+
 app.post("/api/download", downloadLimiter, async (req, res) => {
-  let sourceUrl;
+  let source;
 
   try {
-    sourceUrl = parseHttpUrl(req.body.url);
+    source = parseUrl(req.body.url);
 
-    const platform = identifyPlatform(sourceUrl);
+    const platform = identifyPlatform(source);
 
     if (platform) {
       return res.status(400).json({
         ok: false,
         error:
-          `${platform} foi reconhecido, mas este servidor ainda não possui uma integração autorizada para baixar esse conteúdo.`
+          `${platform} foi reconhecido, mas não há um adaptador de download configurado para esta plataforma.`
       });
     }
 
-    await validateMediaUrl(sourceUrl);
+    if (!looksLikeMediaFile(source)) {
+      throw new Error(
+        "Este endereço não parece ser um arquivo direto de vídeo ou áudio."
+      );
+    }
 
-    const response = await fetch(sourceUrl, {
+    await validateDirectHost(source);
+
+    const response = await fetch(source, {
       method: "GET",
       redirect: "manual",
       signal: AbortSignal.timeout(60000),
       headers: {
-        "User-Agent": "MultiDownload/2.0"
+        "User-Agent": "MultiDownload/3.0"
       }
     });
 
     if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get("location");
-
-      if (!location) {
-        throw new Error("O endereço redirecionou sem informar o destino.");
-      }
-
-      const redirectUrl = new URL(location, sourceUrl);
-
-      if (redirectUrl.protocol !== "https:") {
-        throw new Error("Redirecionamento inseguro bloqueado.");
-      }
-
-      await validateMediaUrl(redirectUrl);
-
-      return res.status(400).json({
-        ok: false,
-        error:
-          "Este arquivo usa redirecionamento. Por segurança, o servidor não seguirá esse endereço automaticamente."
-      });
+      throw new Error(
+        "A fonte redirecionou o endereço. Esse redirecionamento foi bloqueado por segurança."
+      );
     }
 
     if (!response.ok) {
-      throw new Error(`A fonte respondeu com o erro ${response.status}.`);
+      throw new Error(
+        "A fonte não conseguiu fornecer o arquivo. Código: " + response.status
+      );
     }
 
     const contentType = (
       response.headers.get("content-type") || ""
     ).split(";")[0].trim().toLowerCase();
 
-    const allowedTypes = [
-      "video/",
-      "audio/",
-      "application/octet-stream"
-    ];
-
-    if (!allowedTypes.some(type =>
-      type.endsWith("/") ? contentType.startsWith(type) : contentType === type
-    )) {
-      throw new Error("O endereço não parece ser um arquivo de vídeo ou áudio.");
+    if (!MIME_TYPES.includes(contentType)) {
+      throw new Error(
+        "A fonte não forneceu um formato de áudio ou vídeo aceito."
+      );
     }
 
-    const declaredLength = Number(response.headers.get("content-length") || 0);
+    const declaredLength = Number(
+      response.headers.get("content-length") || 0
+    );
 
     if (declaredLength > MAX_FILE_SIZE) {
       throw new Error("O arquivo ultrapassa o limite de 500 MB.");
     }
 
     if (!response.body) {
-      throw new Error("A fonte não forneceu o arquivo.");
+      throw new Error("A fonte não forneceu os dados do arquivo.");
     }
 
-    const filename = getFilename(sourceUrl, contentType);
+    const filename = safeFilename(source, contentType);
 
     res.setHeader("Content-Type", contentType);
     res.setHeader(
@@ -378,9 +450,8 @@ app.post("/api/download", downloadLimiter, async (req, res) => {
     );
     res.setHeader("X-Content-Type-Options", "nosniff");
 
-    let total = 0;
-
     const reader = response.body.getReader();
+    let total = 0;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -391,14 +462,7 @@ app.post("/api/download", downloadLimiter, async (req, res) => {
 
       if (total > MAX_FILE_SIZE) {
         await reader.cancel();
-        if (!res.headersSent) {
-          res.status(413).json({
-            ok: false,
-            error: "O arquivo ultrapassa o limite de 500 MB."
-          });
-        } else {
-          res.destroy();
-        }
+        res.destroy();
         return;
       }
 
@@ -408,13 +472,14 @@ app.post("/api/download", downloadLimiter, async (req, res) => {
     }
 
     res.end();
+
   } catch (error) {
-    console.error("Erro no download:", error.message);
+    console.error("Download:", error.message);
 
     if (!res.headersSent) {
       res.status(400).json({
         ok: false,
-        error: error.message || "Não foi possível processar o arquivo."
+        error: error.message || "Não foi possível realizar o download."
       });
     } else {
       res.destroy();
@@ -422,6 +487,17 @@ app.post("/api/download", downloadLimiter, async (req, res) => {
   }
 });
 
+// --------------------------------------------------
+// ERROS E INICIALIZAÇÃO
+// --------------------------------------------------
+
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: "Rota não encontrada."
+  });
+});
+
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Multi Download 2.0.0 online na porta ${PORT}`);
+  console.log(`Multi Download 3.0.0 online na porta ${PORT}`);
 });
