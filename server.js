@@ -1,50 +1,37 @@
+
 const express = require("express");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const dns = require("node:dns/promises");
+const dns = require("node:dns").promises;
 const net = require("node:net");
-const { Readable, Transform } = require("node:stream");
-const { pipeline } = require("node:stream/promises");
 
 const app = express();
-
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 const SITE_ORIGIN = "https://multi-download-br.netlify.app";
+const MAX_FILE_SIZE = 500 * 1024 * 1024;
 
-const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "")
-  .split(",")
-  .map(host => host.trim().toLowerCase())
-  .filter(Boolean);
+app.disable("x-powered-by");
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
 
-const MAX_SIZE = 500 * 1024 * 1024;
-const MAX_REDIRECTS = 4;
+app.use(express.json({ limit: "30kb" }));
 
-const MEDIA_TYPES = [
-  "video/",
-  "audio/",
-  "application/octet-stream"
-];
-
-app.use(helmet());
-app.use(express.json({ limit: "10kb" }));
-
-// CORS
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
   if (origin && origin !== SITE_ORIGIN) {
     return res.status(403).json({
+      ok: false,
       error: "Origem não autorizada."
     });
   }
 
-  if (origin === SITE_ORIGIN) {
-    res.setHeader("Access-Control-Allow-Origin", SITE_ORIGIN);
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  }
+  res.setHeader("Access-Control-Allow-Origin", SITE_ORIGIN);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(204);
@@ -53,33 +40,117 @@ app.use((req, res, next) => {
   next();
 });
 
-// Limite de requisições
-app.use(rateLimit({
+const downloadLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 15,
-  standardHeaders: "draft-8",
-  legacyHeaders: false
-}));
+  limit: 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: {
+    ok: false,
+    error: "Muitas tentativas. Aguarde um minuto."
+  }
+});
 
-// Verificação básica de IP público
-function ipPublico(ip) {
-  if (net.isIP(ip) === 4) {
-    const p = ip.split(".").map(Number);
+const platformPatterns = [
+  {
+    name: "YouTube",
+    patterns: [
+      /(^|\.)youtube\.com$/i,
+      /(^|\.)youtu\.be$/i,
+      /(^|\.)youtube-nocookie\.com$/i
+    ]
+  },
+  {
+    name: "TikTok",
+    patterns: [
+      /(^|\.)tiktok\.com$/i,
+      /(^|\.)tiktokv\.com$/i
+    ]
+  },
+  {
+    name: "Instagram",
+    patterns: [
+      /(^|\.)instagram\.com$/i
+    ]
+  },
+  {
+    name: "Facebook",
+    patterns: [
+      /(^|\.)facebook\.com$/i,
+      /(^|\.)fb\.watch$/i,
+      /(^|\.)fb\.com$/i
+    ]
+  },
+  {
+    name: "Kwai",
+    patterns: [
+      /(^|\.)kwai\.com$/i,
+      /(^|\.)kuaishou\.com$/i
+    ]
+  },
+  {
+    name: "X",
+    patterns: [
+      /(^|\.)x\.com$/i,
+      /(^|\.)twitter\.com$/i
+    ]
+  }
+];
+
+function identifyPlatform(url) {
+  const hostname = url.hostname.toLowerCase();
+
+  for (const platform of platformPatterns) {
+    if (platform.patterns.some(pattern => pattern.test(hostname))) {
+      return platform.name;
+    }
+  }
+
+  return null;
+}
+
+function parseHttpUrl(value) {
+  if (typeof value !== "string" || value.length > 4096) {
+    throw new Error("Informe um endereço válido.");
+  }
+
+  let parsed;
+
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    throw new Error("O endereço informado é inválido.");
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new Error("Por segurança, somente links HTTPS são aceitos.");
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error("Links com usuário ou senha não são aceitos.");
+  }
+
+  return parsed;
+}
+
+function isPublicIp(address) {
+  const family = net.isIP(address);
+
+  if (family === 4) {
+    const parts = address.split(".").map(Number);
+    const [a, b] = parts;
 
     if (
-      p[0] === 0 ||
-      p[0] === 10 ||
-      p[0] === 127 ||
-      p[0] >= 224 ||
-      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||
-      (p[0] === 169 && p[1] === 254) ||
-      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
-      (p[0] === 192 && p[1] === 168) ||
-      (p[0] === 192 && p[1] === 0 && p[2] === 0) ||
-      (p[0] === 192 && p[1] === 0 && p[2] === 2) ||
-      (p[0] === 198 && (p[1] === 18 || p[1] === 19)) ||
-      (p[0] === 198 && p[1] === 51 && p[2] === 100) ||
-      (p[0] === 203 && p[1] === 0 && p[2] === 113)
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 192 && b === 0) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
     ) {
       return false;
     }
@@ -87,157 +158,218 @@ function ipPublico(ip) {
     return true;
   }
 
-  if (net.isIP(ip) === 6) {
-    const normalized = ip.toLowerCase();
+  if (family === 6) {
+    const ip = address.toLowerCase();
 
-    // Aceita apenas IPv6 global unicast
-    return (
-      (normalized.startsWith("2") || normalized.startsWith("3")) &&
-      !normalized.startsWith("2001:db8:")
-    );
+    if (
+      ip === "::" ||
+      ip === "::1" ||
+      ip.startsWith("fc") ||
+      ip.startsWith("fd") ||
+      ip.startsWith("fe8") ||
+      ip.startsWith("fe9") ||
+      ip.startsWith("fea") ||
+      ip.startsWith("feb") ||
+      ip.startsWith("::ffff:")
+    ) {
+      return false;
+    }
+
+    return true;
   }
 
   return false;
 }
 
-// Validar endereço
-async function validarUrl(value) {
-  let url;
+function getAllowedHosts() {
+  return (process.env.ALLOWED_HOSTS || "")
+    .split(",")
+    .map(host => host.trim().toLowerCase())
+    .filter(Boolean);
+}
 
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error("Link inválido.");
+function hostIsAllowed(hostname) {
+  const allowed = getAllowedHosts();
+
+  return allowed.some(host =>
+    hostname === host || hostname.endsWith("." + host)
+  );
+}
+
+async function validateMediaUrl(url) {
+  if (!hostIsAllowed(url.hostname.toLowerCase())) {
+    throw new Error(
+      "Este domínio não está autorizado para downloads neste servidor."
+    );
   }
 
-  if (url.protocol !== "https:") {
-    throw new Error("Utilize um endereço HTTPS.");
-  }
-
-  if (url.username || url.password) {
-    throw new Error("Endereço não permitido.");
-  }
-
-  if (url.port && url.port !== "443") {
-    throw new Error("Porta não permitida.");
-  }
-
-  const host = url.hostname.toLowerCase();
-
-  if (!ALLOWED_HOSTS.includes(host)) {
-    throw new Error("Este domínio ainda não está autorizado.");
-  }
-
-  const addresses = await dns.lookup(host, {
+  const addresses = await dns.lookup(url.hostname, {
     all: true,
     verbatim: true
   });
 
-  if (!addresses.length || addresses.some(item => !ipPublico(item.address))) {
-    throw new Error("Endereço de servidor não permitido.");
+  if (!addresses.length || addresses.some(item => !isPublicIp(item.address))) {
+    throw new Error("O endereço do servidor não passou na validação de segurança.");
+  }
+}
+
+function getFilename(url, contentType) {
+  const pathname = decodeURIComponent(url.pathname);
+  const lastPart = pathname.split("/").filter(Boolean).pop();
+
+  if (lastPart && lastPart.includes(".")) {
+    return lastPart.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
   }
 
-  return url;
+  const extensions = {
+    "video/mp4": "video.mp4",
+    "video/webm": "video.webm",
+    "audio/mpeg": "audio.mp3",
+    "audio/mp3": "audio.mp3",
+    "audio/mp4": "audio.m4a",
+    "audio/wav": "audio.wav",
+    "audio/ogg": "audio.ogg"
+  };
+
+  return extensions[contentType] || "arquivo-download";
 }
 
-// Nome seguro do arquivo
-function nomeSeguro(value) {
-  return String(value || "arquivo")
-    .replace(/[\r\n"]/g, "")
-    .replace(/[^a-zA-Z0-9._-]/g, "_")
-    .slice(0, 120) || "arquivo";
-}
-
-// Página inicial
 app.get("/", (req, res) => {
   res.json({
     name: "Multi Download",
     status: "online",
-    version: "1.2.0",
-    message: "Servidor de downloads iniciado."
+    version: "2.0.0",
+    message: "Servidor iniciado."
   });
 });
 
-// Status da API
 app.get("/api/status", (req, res) => {
   res.json({
+    ok: true,
     online: true,
     downloads: true,
-    version: "1.2.0"
+    version: "2.0.0",
+    platformRecognition: true,
+    imageTools: "browser",
+    directMediaDownloads: getAllowedHosts().length > 0
   });
 });
 
-// Download de arquivos diretos autorizados
-app.get("/api/download", async (req, res) => {
-  let response;
+app.post("/api/inspect", (req, res) => {
+  try {
+    const url = parseHttpUrl(req.body.url);
+    const platform = identifyPlatform(url);
+
+    if (platform) {
+      return res.json({
+        ok: true,
+        recognized: true,
+        platform,
+        type: "platform-page",
+        downloadAvailable: false,
+        message:
+          "Plataforma reconhecida. O download depende de uma integração autorizada e da disponibilidade do conteúdo."
+      });
+    }
+
+    return res.json({
+      ok: true,
+      recognized: true,
+      platform: "Link externo",
+      type: "direct-or-unknown",
+      downloadAvailable: false,
+      message:
+        "Link reconhecido. Para confirmar se é um arquivo de mídia, use a opção de verificar arquivo."
+    });
+  } catch (error) {
+    return res.status(400).json({
+      ok: false,
+      recognized: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/api/download", downloadLimiter, async (req, res) => {
+  let sourceUrl;
 
   try {
-    if (typeof req.query.url !== "string") {
-      throw new Error("Informe um link para download.");
+    sourceUrl = parseHttpUrl(req.body.url);
+
+    const platform = identifyPlatform(sourceUrl);
+
+    if (platform) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          `${platform} foi reconhecido, mas este servidor ainda não possui uma integração autorizada para baixar esse conteúdo.`
+      });
     }
 
-    let remote = await validarUrl(req.query.url);
+    await validateMediaUrl(sourceUrl);
 
-    for (let attempt = 0; attempt <= MAX_REDIRECTS; attempt++) {
-      response = await fetch(remote, {
-        redirect: "manual",
-        signal: AbortSignal.timeout(120000)
-      });
+    const response = await fetch(sourceUrl, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(60000),
+      headers: {
+        "User-Agent": "MultiDownload/2.0"
+      }
+    });
 
-      if ([301, 302, 303, 307, 308].includes(response.status)) {
-        const location = response.headers.get("location");
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
 
-        await response.body?.cancel().catch(() => {});
-
-        if (!location || attempt === MAX_REDIRECTS) {
-          throw new Error("Redirecionamento inválido ou excessivo.");
-        }
-
-        remote = await validarUrl(
-          new URL(location, remote).href
-        );
-
-        continue;
+      if (!location) {
+        throw new Error("O endereço redirecionou sem informar o destino.");
       }
 
-      break;
+      const redirectUrl = new URL(location, sourceUrl);
+
+      if (redirectUrl.protocol !== "https:") {
+        throw new Error("Redirecionamento inseguro bloqueado.");
+      }
+
+      await validateMediaUrl(redirectUrl);
+
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Este arquivo usa redirecionamento. Por segurança, o servidor não seguirá esse endereço automaticamente."
+      });
     }
 
-    if (!response || !response.ok) {
-      throw new Error("Não foi possível acessar o arquivo.");
+    if (!response.ok) {
+      throw new Error(`A fonte respondeu com o erro ${response.status}.`);
     }
 
     const contentType = (
       response.headers.get("content-type") || ""
     ).split(";")[0].trim().toLowerCase();
 
-    if (!MEDIA_TYPES.some(type => contentType.startsWith(type))) {
-      throw new Error("O endereço não forneceu um arquivo de mídia.");
+    const allowedTypes = [
+      "video/",
+      "audio/",
+      "application/octet-stream"
+    ];
+
+    if (!allowedTypes.some(type =>
+      type.endsWith("/") ? contentType.startsWith(type) : contentType === type
+    )) {
+      throw new Error("O endereço não parece ser um arquivo de vídeo ou áudio.");
     }
 
-    const contentLength = Number(
-      response.headers.get("content-length") || 0
-    );
+    const declaredLength = Number(response.headers.get("content-length") || 0);
 
-    if (contentLength > MAX_SIZE) {
+    if (declaredLength > MAX_FILE_SIZE) {
       throw new Error("O arquivo ultrapassa o limite de 500 MB.");
     }
 
     if (!response.body) {
-      throw new Error("Arquivo indisponível.");
+      throw new Error("A fonte não forneceu o arquivo.");
     }
 
-    let pathName = "arquivo";
-
-    try {
-      pathName = decodeURIComponent(
-        remote.pathname.split("/").pop() || "arquivo"
-      );
-    } catch {
-      pathName = "arquivo";
-    }
-
-    const filename = nomeSeguro(pathName);
+    const filename = getFilename(sourceUrl, contentType);
 
     res.setHeader("Content-Type", contentType);
     res.setHeader(
@@ -246,39 +378,43 @@ app.get("/api/download", async (req, res) => {
     );
     res.setHeader("X-Content-Type-Options", "nosniff");
 
-    if (contentLength > 0) {
-      res.setHeader("Content-Length", contentLength);
-    }
-
     let total = 0;
 
-    const limiter = new Transform({
-      transform(chunk, encoding, callback) {
-        total += chunk.length;
+    const reader = response.body.getReader();
 
-        if (total > MAX_SIZE) {
-          callback(new Error("Arquivo ultrapassa 500 MB."));
-          return;
+    while (true) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+
+      total += value.byteLength;
+
+      if (total > MAX_FILE_SIZE) {
+        await reader.cancel();
+        if (!res.headersSent) {
+          res.status(413).json({
+            ok: false,
+            error: "O arquivo ultrapassa o limite de 500 MB."
+          });
+        } else {
+          res.destroy();
         }
-
-        callback(null, chunk);
+        return;
       }
-    });
 
-    await pipeline(
-      Readable.fromWeb(response.body),
-      limiter,
-      res
-    );
-
-  } catch (error) {
-    if (response?.body) {
-      await response.body.cancel().catch(() => {});
+      if (!res.write(Buffer.from(value))) {
+        await new Promise(resolve => res.once("drain", resolve));
+      }
     }
+
+    res.end();
+  } catch (error) {
+    console.error("Erro no download:", error.message);
 
     if (!res.headersSent) {
       res.status(400).json({
-        error: error.message || "Falha no download."
+        ok: false,
+        error: error.message || "Não foi possível processar o arquivo."
       });
     } else {
       res.destroy();
@@ -286,8 +422,6 @@ app.get("/api/download", async (req, res) => {
   }
 });
 
-// Iniciar servidor
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Multi Download online na porta ${PORT}`);
+  console.log(`Multi Download 2.0.0 online na porta ${PORT}`);
 });
-       
