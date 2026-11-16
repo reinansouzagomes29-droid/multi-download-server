@@ -1,4 +1,3 @@
-
 "use strict";
 
 const express = require("express");
@@ -8,6 +7,9 @@ const dns = require("node:dns").promises;
 const net = require("node:net");
 
 const app = express();
+
+// Necessário para o express-rate-limit funcionar corretamente atrás de proxies (Render, Railway, etc.)
+app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 10000;
 const SITE_ORIGIN = "https://multi-download-br.netlify.app";
@@ -149,6 +151,10 @@ function parseUrl(value) {
     throw new Error("Links com credenciais não são aceitos.");
   }
 
+  if (url.port && url.port !== "443") {
+    throw new Error("Apenas a porta HTTPS padrão (443) é permitida.");
+  }
+
   return url;
 }
 
@@ -216,7 +222,9 @@ function isPublicIp(address) {
       ip.startsWith("fc") || ip.startsWith("fd") ||
       ip.startsWith("fe8") || ip.startsWith("fe9") ||
       ip.startsWith("fea") || ip.startsWith("feb") ||
-      ip.startsWith("::ffff:")
+      ip.startsWith("::ffff:") ||
+      ip.startsWith("2002:") ||
+      ip.startsWith("64:ff9b:")
     ) {
       return false;
     }
@@ -228,13 +236,19 @@ function isPublicIp(address) {
 }
 
 async function validateDirectHost(url) {
-  if (!isHostAllowed(url.hostname.toLowerCase())) {
+  const hostname = url.hostname.toLowerCase();
+
+  if (net.isIP(hostname) !== 0) {
+    throw new Error("Endereços IP diretos não são permitidos.");
+  }
+
+  if (!isHostAllowed(hostname)) {
     throw new Error(
       "Este domínio ainda não foi autorizado para downloads."
     );
   }
 
-  const addresses = await dns.lookup(url.hostname, {
+  const addresses = await dns.lookup(hostname, {
     all: true,
     verbatim: true
   });
@@ -248,22 +262,31 @@ async function validateDirectHost(url) {
 }
 
 function safeFilename(url, contentType) {
-  const lastPart = decodeURIComponent(url.pathname)
-    .split("/")
-    .filter(Boolean)
-    .pop();
+  try {
+    const lastPart = decodeURIComponent(url.pathname)
+      .split("/")
+      .filter(Boolean)
+      .pop();
 
-  if (lastPart && /\.[a-z0-9]{2,5}$/i.test(lastPart)) {
-    return lastPart.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+    if (lastPart && /\.[a-z0-9]{2,5}$/i.test(lastPart)) {
+      return lastPart.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+    }
+  } catch {
+    // Ignora falha de decodeURIComponent e usa fallback
   }
 
   const fallback = {
     "video/mp4": "video.mp4",
     "video/webm": "video.webm",
+    "video/quicktime": "video.mov",
+    "video/x-matroska": "video.mkv",
     "audio/mpeg": "audio.mp3",
     "audio/mp4": "audio.m4a",
+    "audio/aac": "audio.aac",
     "audio/wav": "audio.wav",
-    "audio/ogg": "audio.ogg"
+    "audio/x-wav": "audio.wav",
+    "audio/ogg": "audio.ogg",
+    "audio/flac": "audio.flac"
   };
 
   return fallback[contentType] || "arquivo-midia";
@@ -272,11 +295,6 @@ function safeFilename(url, contentType) {
 // --------------------------------------------------
 // ADAPTADORES DE PLATAFORMA
 // --------------------------------------------------
-
-// Cada plataforma terá seu próprio adaptador.
-// Os adaptadores serão habilitados quando houver uma
-// integração autorizada, credenciais e documentação.
-// Não simulamos downloads quando o adaptador não existe.
 
 const platformAdapters = {
   "YouTube": null,
@@ -336,7 +354,7 @@ app.get("/api/status", (req, res) => {
 
 app.post("/api/inspect", (req, res) => {
   try {
-    const url = parseUrl(req.body.url);
+    const url = parseUrl(req.body?.url);
     const platform = identifyPlatform(url);
 
     if (platform) {
@@ -348,6 +366,7 @@ app.post("/api/inspect", (req, res) => {
     }
 
     const directCandidate = looksLikeMediaFile(url);
+    const hostAllowed = isHostAllowed(url.hostname.toLowerCase());
 
     return res.json({
       ok: true,
@@ -355,9 +374,11 @@ app.post("/api/inspect", (req, res) => {
       recognized: true,
       platform: "Link externo",
       directCandidate,
-      downloadAvailable: false,
+      downloadAvailable: directCandidate && hostAllowed,
       message: directCandidate
-        ? "O endereço parece apontar para um arquivo de mídia. O servidor ainda precisa verificar o arquivo."
+        ? hostAllowed
+          ? "O endereço parece apontar para um arquivo de mídia autorizado."
+          : "O endereço parece ser um arquivo de mídia, mas o domínio não está na lista de permitidos."
         : "O endereço foi reconhecido, mas não parece ser um link direto de vídeo ou áudio."
     });
 
@@ -376,9 +397,10 @@ app.post("/api/inspect", (req, res) => {
 
 app.post("/api/download", downloadLimiter, async (req, res) => {
   let source;
+  let reader;
 
   try {
-    source = parseUrl(req.body.url);
+    source = parseUrl(req.body?.url);
 
     const platform = identifyPlatform(source);
 
@@ -390,114 +412,4 @@ app.post("/api/download", downloadLimiter, async (req, res) => {
       });
     }
 
-    if (!looksLikeMediaFile(source)) {
-      throw new Error(
-        "Este endereço não parece ser um arquivo direto de vídeo ou áudio."
-      );
-    }
-
-    await validateDirectHost(source);
-
-    const response = await fetch(source, {
-      method: "GET",
-      redirect: "manual",
-      signal: AbortSignal.timeout(60000),
-      headers: {
-        "User-Agent": "MultiDownload/3.0"
-      }
-    });
-
-    if (response.status >= 300 && response.status < 400) {
-      throw new Error(
-        "A fonte redirecionou o endereço. Esse redirecionamento foi bloqueado por segurança."
-      );
-    }
-
-    if (!response.ok) {
-      throw new Error(
-        "A fonte não conseguiu fornecer o arquivo. Código: " + response.status
-      );
-    }
-
-    const contentType = (
-      response.headers.get("content-type") || ""
-    ).split(";")[0].trim().toLowerCase();
-
-    if (!MIME_TYPES.includes(contentType)) {
-      throw new Error(
-        "A fonte não forneceu um formato de áudio ou vídeo aceito."
-      );
-    }
-
-    const declaredLength = Number(
-      response.headers.get("content-length") || 0
-    );
-
-    if (declaredLength > MAX_FILE_SIZE) {
-      throw new Error("O arquivo ultrapassa o limite de 500 MB.");
-    }
-
-    if (!response.body) {
-      throw new Error("A fonte não forneceu os dados do arquivo.");
-    }
-
-    const filename = safeFilename(source, contentType);
-
-    res.setHeader("Content-Type", contentType);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${filename}"`
-    );
-    res.setHeader("X-Content-Type-Options", "nosniff");
-
-    const reader = response.body.getReader();
-    let total = 0;
-
-    while (true) {
-      const { done, value } = await reader.read();
-
-      if (done) break;
-
-      total += value.byteLength;
-
-      if (total > MAX_FILE_SIZE) {
-        await reader.cancel();
-        res.destroy();
-        return;
-      }
-
-      if (!res.write(Buffer.from(value))) {
-        await new Promise(resolve => res.once("drain", resolve));
-      }
-    }
-
-    res.end();
-
-  } catch (error) {
-    console.error("Download:", error.message);
-
-    if (!res.headersSent) {
-      res.status(400).json({
-        ok: false,
-        error: error.message || "Não foi possível realizar o download."
-      });
-    } else {
-      res.destroy();
-    }
-  }
-});
-
-// --------------------------------------------------
-// ERROS E INICIALIZAÇÃO
-// --------------------------------------------------
-
-app.use((req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: "Rota não encontrada."
-  });
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Multi Download 3.0.0 online na porta ${PORT}`);
-});
+  
